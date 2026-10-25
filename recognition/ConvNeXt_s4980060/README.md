@@ -67,17 +67,35 @@ right.
 
 ### 3.3 Preliminary Feasibility Evidence
 
-**Data audit.** The dataset contains **30,520 image slices** (14,860 AD and 15,660 CN), so the two classes are
-roughly balanced. These come from **1,526 scans** (743 AD and 783 CN), and each scan has exactly 20 slices.
-There are **680 unique patients**.
+**Data audit.** The dataset contains **30,520 image slices** (14,860 AD and 15,660 CN), drawn from
+**1,526 scans** (743 AD and 783 CN) at exactly 20 slices per scan, belonging to **680 unique patients**.
 
-**Key finding:** the dataset's provided `train` and `test` folders **share 216 of the same patients**, which
-would make test results look better than they really are. So I combine all the images and split them again by
-patient (70% train, 15% validation, 15% test, with a similar AD/CN mix in each), then check that no patient
-appears in more than one set.
+The patient identifier is *not* the number in the filename: `218391_78.jpeg` identifies a scan, and one
+patient may be scanned at several visits. Real ADNI subject ids (e.g. `068_S_0473`) are recovered from
+`meta_data_with_label.json`, which maps each scan to the raw NIfTI it came from. Resolving them matters,
+because the class balance looks very different at the two levels:
 
-**Smoke test (RTX 4070 laptop GPU).** The new patient-level split has 680 patients (train 475 / val 102 /
-test 103) with zero overlap, and no patient has both labels.
+| Level | AD | CN | Balance |
+|-------|----|----|---------|
+| Slices | 14,860 | 15,660 | 49 / 51 |
+| Patients | 221 | 459 | 32 / 68 |
+
+The slice-level balance is an artefact: AD patients average 3.36 scans each against 1.71 for CN, so the two
+classes even out only after a patient is counted once per scan. Training operates on slices and is therefore
+effectively balanced, but **any patient-level metric faces a 68% majority-class baseline** — predicting CN
+for everyone would score 0.68. Per-class recall, macro-F1 and AUROC are reported for this reason, rather than
+aggregate accuracy alone.
+
+**Key finding:** once real subject ids are resolved, the dataset's provided `train` and `test` folders
+**share 216 of the same patients**, which would make test results look better than they really are. (Judged by
+the scan number in the filename the folders appear perfectly disjoint, which is exactly why the leakage is easy
+to miss.) So I combine all the images and split them again by patient (70% train, 15% validation, 15% test,
+stratified so each split keeps a similar AD/CN mix), then assert that no patient appears in more than one set.
+
+**Smoke test (RTX 4070 laptop GPU).** The rebuilt split assigns all 680 patients as train 476 / val 102 /
+test 102 (21,560 / 4,580 / 4,380 slices) with zero overlap, and no patient carries both labels. Folder-derived
+labels were additionally cross-checked against the diagnostic code in `meta_data_with_label.json`: all 1,526
+scans agree.
 
 | Model | Parameters | Measurement | Result |
 |-------|-----------|-------------|--------|
