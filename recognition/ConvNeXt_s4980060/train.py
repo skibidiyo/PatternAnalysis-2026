@@ -41,7 +41,17 @@ from modules import build_model, count_parameters
 def parse_args():
     """Command-line configuration for a training run."""
     parser = argparse.ArgumentParser(description="Train the ADNI AD vs CN classifier.")
-    parser.add_argument("--model", choices=["convnext", "baseline"], default="convnext")
+    parser.add_argument(
+        "--model",
+        choices=["convnext", "convnext-pretrained", "convnext-mini", "baseline"],
+        default="convnext",
+    )
+    parser.add_argument(
+        "--augment",
+        choices=["light", "strong"],
+        default="light",
+        help="Training augmentation strength.",
+    )
     parser.add_argument("--data-root", default="/home/groups/comp3710/ADNI/AD_NC")
     parser.add_argument("--metadata", default=None, help="meta_data_with_label.json path")
     parser.add_argument("--epochs", type=int, default=30)
@@ -369,6 +379,7 @@ def main():
         seed=args.seed,
         num_workers=args.num_workers,
         metadata_path=args.metadata,
+        augment=args.augment,
     )
     print(
         f"Patients  train {data_info['n_patients']['train']} / "
@@ -379,7 +390,9 @@ def main():
         f"val {data_info['n_slices']['val']} / test {data_info['n_slices']['test']}"
     )
 
-    model_kwargs = {"drop_path_rate": args.drop_path} if args.model == "convnext" else {}
+    model_kwargs = (
+        {"drop_path_rate": args.drop_path} if args.model.startswith("convnext") else {}
+    )
     model = build_model(args.model, **model_kwargs).to(device)
     params = count_parameters(model)
     print(f"Parameters: {params['total'] / 1e6:.2f}M")

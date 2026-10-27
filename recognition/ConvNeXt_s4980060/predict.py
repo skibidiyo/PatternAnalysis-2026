@@ -65,7 +65,7 @@ def load_checkpoint(path, device):
     saved_args = checkpoint.get("args", {})
 
     kwargs = {}
-    if model_name == "convnext" and "drop_path" in saved_args:
+    if model_name.startswith("convnext") and "drop_path" in saved_args:
         # Drop path is inactive at eval, but rebuild the identical architecture.
         kwargs["drop_path_rate"] = saved_args["drop_path"]
 

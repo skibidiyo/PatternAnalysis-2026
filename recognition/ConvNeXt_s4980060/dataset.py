@@ -295,25 +295,49 @@ def verify_split_disjoint(splits):
     return True
 
 
-def build_transforms(train, image_size=DEFAULT_IMAGE_SIZE, mean=None, std=None):
+def build_transforms(
+    train, image_size=DEFAULT_IMAGE_SIZE, mean=None, std=None, augment="light"
+):
     """Compose the preprocessing pipeline.
 
-    Augmentation (horizontal flip, small rotation) is applied to the training
-    split only; val and test stay deterministic so metrics are comparable across
-    epochs and between models.
+    Augmentation is applied to the training split only; val and test stay
+    deterministic so metrics are comparable across epochs and between models.
+
+    Two strengths are available. "light" is a horizontal flip and a small
+    rotation. "strong" adds random resized cropping and brightness/contrast
+    jitter, which matter once a high-capacity model is used: ConvNeXt-T reaches
+    99% training accuracy under light augmentation while validation accuracy
+    stalls, so the training set needs to be harder to memorise.
+
+    Rotation and flipping are anatomically safe here - brains are roughly
+    bilaterally symmetric and the slices are already coarsely aligned - while
+    scale and intensity jitter mimic scanner and acquisition variation.
     """
     mean = [0.5] if mean is None else mean
     std = [0.5] if std is None else std
+    if augment not in {"light", "strong"}:
+        raise ValueError(f"augment must be 'light' or 'strong', got {augment!r}")
 
-    common = [
-        transforms.Grayscale(num_output_channels=1),
-        transforms.Resize((image_size, image_size)),
-    ]
-    if train:
+    common = [transforms.Grayscale(num_output_channels=1)]
+
+    if train and augment == "strong":
         common += [
+            transforms.RandomResizedCrop(
+                image_size, scale=(0.7, 1.0), ratio=(0.9, 1.1)
+            ),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=15),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        ]
+    elif train:
+        common += [
+            transforms.Resize((image_size, image_size)),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomRotation(degrees=10),
         ]
+    else:
+        common += [transforms.Resize((image_size, image_size))]
+
     common += [
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
@@ -388,6 +412,7 @@ def get_dataloaders(
     val_frac=0.15,
     test_frac=0.15,
     metadata_path=None,
+    augment="light",
 ):
     """End-to-end: index (with real patient ids), split, verify, wrap in
     DataLoaders.
@@ -401,7 +426,9 @@ def get_dataloaders(
 
     mean, std = compute_channel_stats(splits["train"], image_size=image_size)
 
-    train_transform = build_transforms(train=True, image_size=image_size, mean=mean, std=std)
+    train_transform = build_transforms(
+        train=True, image_size=image_size, mean=mean, std=std, augment=augment
+    )
     eval_transform = build_transforms(train=False, image_size=image_size, mean=mean, std=std)
 
     train_ds = ADNISliceDataset(splits["train"], transform=train_transform)
@@ -422,6 +449,7 @@ def get_dataloaders(
         "mean": mean,
         "std": std,
         "seed": seed,
+        "augment": augment,
         "n_patients": {name: len({r.patient_id for r in recs}) for name, recs in splits.items()},
         "n_slices": {name: len(recs) for name, recs in splits.items()},
     }

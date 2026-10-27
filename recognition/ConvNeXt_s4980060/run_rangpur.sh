@@ -10,25 +10,47 @@
 #
 # Train the ADNI AD vs CN classifier on the Rangpur HPC cluster.
 #
-#   sbatch run_rangpur.sh convnext      # train ConvNeXt (default)
-#   sbatch run_rangpur.sh baseline      # train the CNN baseline
+#   sbatch run_rangpur.sh convnext-pretrained   # the headline model
+#   sbatch run_rangpur.sh baseline              # the CNN baseline
+#   sbatch run_rangpur.sh convnext              # ConvNeXt from scratch
+#   sbatch run_rangpur.sh convnext-mini         # smaller ConvNeXt from scratch
 #
-# Both models must be trained before the comparison in the README can be made;
+# Every model must be trained before the comparison in the README can be made;
 # they share a seed and therefore an identical patient-level split.
+#
+# convnext-pretrained needs the ImageNet weights cached in $HOME before the job
+# starts, because compute nodes have no outbound network access. Run this once
+# on the login node:
+#
+#   python -c "from torchvision.models import convnext_tiny, ConvNeXt_Tiny_Weights; \
+#              convnext_tiny(weights=ConvNeXt_Tiny_Weights.IMAGENET1K_V1)"
 #
 # Author: s4980060
 
 set -euo pipefail
 
-MODEL="${1:-convnext}"
-DATA_ROOT="/home/groups/comp3710/ADNI/AD_NC"
-EPOCHS="${EPOCHS:-30}"
+MODEL="${1:-convnext-pretrained}"
+DATA_ROOT="${DATA_ROOT:-/home/groups/comp3710/ADNI/AD_NC}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 SEED="${SEED:-42}"
 
+# Fine-tuning converges in far fewer epochs and needs a much smaller learning
+# rate than training from scratch; using the from-scratch recipe on pretrained
+# weights destroys them in the first few steps.
+case "$MODEL" in
+    convnext-pretrained)
+        EPOCHS="${EPOCHS:-12}"
+        LR="${LR:-5e-5}"
+        ;;
+    *)
+        EPOCHS="${EPOCHS:-30}"
+        LR="${LR:-3e-4}"
+        ;;
+esac
+
 mkdir -p logs outputs assets
 
-echo "Job $SLURM_JOB_ID on $(hostname), model=$MODEL"
+echo "Job $SLURM_JOB_ID on $(hostname), model=$MODEL epochs=$EPOCHS lr=$LR"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 # A batch job starts from a clean environment, so conda must be activated here
@@ -47,10 +69,23 @@ if [[ ! -f "$METADATA" ]]; then
     exit 1
 fi
 
+# Same idea for the pretrained weights: a missing cache would otherwise surface
+# as a network timeout several minutes into the job.
+if [[ "$MODEL" == "convnext-pretrained" ]]; then
+    CACHE="${TORCH_HOME:-$HOME/.cache/torch}/hub/checkpoints"
+    if ! ls "$CACHE"/convnext_tiny-*.pth >/dev/null 2>&1; then
+        echo "ERROR: ImageNet weights not cached in $CACHE" >&2
+        echo "Compute nodes cannot reach the internet. Pre-download them on the" >&2
+        echo "login node using the command in this script's header." >&2
+        exit 1
+    fi
+fi
+
 python -u train.py \
     --model "$MODEL" \
     --data-root "$DATA_ROOT" \
     --epochs "$EPOCHS" \
+    --lr "$LR" \
     --batch-size "$BATCH_SIZE" \
     --seed "$SEED" \
     --num-workers "$SLURM_CPUS_PER_TASK" \

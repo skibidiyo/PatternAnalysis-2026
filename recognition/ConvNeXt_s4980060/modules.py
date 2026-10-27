@@ -192,13 +192,137 @@ class ConvNeXt(nn.Module):
         return self.head(self.forward_features(x))
 
 
-def convnext_tiny(in_channels=1, num_classes=2, drop_path_rate=0.1):
-    """ConvNeXt-T: depths (3, 3, 9, 3), dims (96, 192, 384, 768), ~28M params."""
-    return ConvNeXt(
+def convnext_tiny(in_channels=1, num_classes=2, drop_path_rate=0.1, pretrained=False):
+    """ConvNeXt-T: depths (3, 3, 9, 3), dims (96, 192, 384, 768), ~28M params.
+
+    With pretrained=True the ImageNet-1k weights are copied in; see
+    load_imagenet_weights for what is and is not transferred.
+    """
+    model = ConvNeXt(
         in_channels=in_channels,
         num_classes=num_classes,
         depths=(3, 3, 9, 3),
         dims=(96, 192, 384, 768),
+        drop_path_rate=drop_path_rate,
+    )
+    if pretrained:
+        load_imagenet_weights(model)
+    return model
+
+
+def load_imagenet_weights(model, verbose=True):
+    """Copy torchvision's ImageNet ConvNeXt-T weights into this implementation.
+
+    Training ConvNeXt from scratch on roughly 476 patients does not work: three
+    configurations all plateau near 0.69 test accuracy. Transfer learning is the
+    standard remedy for small medical datasets - the early layers learn generic
+    edge and texture filters that this dataset is far too small to discover.
+
+    Only the initial weights are borrowed; the architecture is the one defined
+    above, which matches the paper's parameter count to within 0.04%. The layer
+    names differ from torchvision's, so the mapping is explicit below.
+
+    The stem is adapted from 3 input channels to 1 by summing across the colour
+    axis. Summing (rather than averaging) preserves the response magnitude a
+    grey image would produce if its single channel were replicated into RGB.
+
+    The classifier head is not copied: it predicts 1000 ImageNet classes, while
+    this task has 2, and it is trained from scratch.
+    """
+    from torchvision.models import ConvNeXt_Tiny_Weights, convnext_tiny as tv_convnext_tiny
+
+    source = tv_convnext_tiny(weights=ConvNeXt_Tiny_Weights.IMAGENET1K_V1).state_dict()
+    target = model.state_dict()
+    mapping = {}
+
+    # Stem: conv + norm. features.0.{0,1} -> downsample_layers.0.{0,1}
+    mapping["features.0.0.weight"] = "downsample_layers.0.0.weight"
+    mapping["features.0.0.bias"] = "downsample_layers.0.0.bias"
+    mapping["features.0.1.weight"] = "downsample_layers.0.1.weight"
+    mapping["features.0.1.bias"] = "downsample_layers.0.1.bias"
+
+    # Downsampling layers between stages: features.{2,4,6} -> downsample_layers.{1,2,3}
+    for source_idx, target_idx in zip((2, 4, 6), (1, 2, 3)):
+        for sub in (0, 1):
+            for suffix in ("weight", "bias"):
+                mapping[f"features.{source_idx}.{sub}.{suffix}"] = (
+                    f"downsample_layers.{target_idx}.{sub}.{suffix}"
+                )
+
+    # Blocks: features.{1,3,5,7}.{i} -> stages.{0,1,2,3}.{i}
+    # torchvision packs each block into a Sequential, so block.0 is the depthwise
+    # convolution, block.2 the LayerNorm, and block.3/5 the two Linear layers.
+    block_parts = {
+        "block.0": "depthwise",
+        "block.2": "norm",
+        "block.3": "pointwise1",
+        "block.5": "pointwise2",
+    }
+    for source_idx, (target_idx, depth) in zip(
+        (1, 3, 5, 7), enumerate((3, 3, 9, 3))
+    ):
+        for i in range(depth):
+            for source_part, target_part in block_parts.items():
+                for suffix in ("weight", "bias"):
+                    mapping[f"features.{source_idx}.{i}.{source_part}.{suffix}"] = (
+                        f"stages.{target_idx}.{i}.{target_part}.{suffix}"
+                    )
+            mapping[f"features.{source_idx}.{i}.layer_scale"] = (
+                f"stages.{target_idx}.{i}.gamma"
+            )
+
+    # Final norm applied to the pooled features.
+    mapping["classifier.0.weight"] = "norm.weight"
+    mapping["classifier.0.bias"] = "norm.bias"
+
+    loaded, skipped = 0, []
+    for source_key, target_key in mapping.items():
+        if source_key not in source or target_key not in target:
+            skipped.append(target_key)
+            continue
+        tensor = source[source_key]
+
+        if target_key == "downsample_layers.0.0.weight":
+            # (96, 3, 4, 4) -> (96, in_channels, 4, 4)
+            in_channels = target[target_key].shape[1]
+            if in_channels == 1:
+                tensor = tensor.sum(dim=1, keepdim=True)
+            elif in_channels != tensor.shape[1]:
+                skipped.append(target_key)
+                continue
+        elif target_key.endswith("gamma"):
+            tensor = tensor.reshape(-1)  # (C, 1, 1) -> (C,)
+
+        if tensor.shape != target[target_key].shape:
+            skipped.append(target_key)
+            continue
+        target[target_key] = tensor
+        loaded += 1
+
+    model.load_state_dict(target)
+    if verbose:
+        total = len([k for k in target if not k.startswith("head.")])
+        print(f"Loaded {loaded}/{total} pretrained tensors (head trained from scratch)")
+        if skipped:
+            print(f"  skipped: {len(skipped)} e.g. {skipped[:3]}")
+    return model
+
+
+def convnext_mini(in_channels=1, num_classes=2, drop_path_rate=0.4):
+    """A deliberately small ConvNeXt: dims (48, 96, 192, 384), ~3M parameters.
+
+    ConvNeXt-T overfits this dataset badly - 27.8M parameters against roughly
+    476 training patients drives training accuracy to 99% while validation
+    accuracy stalls near 64%. This variant keeps every architectural element of
+    ConvNeXt (patchify stem, 7x7 depthwise blocks, inverted bottleneck, layer
+    scale) and only reduces width and depth, so capacity can be tested as the
+    cause rather than being confounded with a change of architecture.
+    """
+    return ConvNeXt(
+        in_channels=in_channels,
+        num_classes=num_classes,
+        depths=(2, 2, 6, 2),
+        dims=(48, 96, 192, 384),
         drop_path_rate=drop_path_rate,
     )
 
@@ -247,6 +371,15 @@ def build_model(name, in_channels=1, num_classes=2, **kwargs):
     name = name.lower()
     if name == "convnext":
         return convnext_tiny(in_channels=in_channels, num_classes=num_classes, **kwargs)
+    if name == "convnext-pretrained":
+        return convnext_tiny(
+            in_channels=in_channels, num_classes=num_classes, pretrained=True, **kwargs
+        )
+    if name == "convnext-mini":
+        return convnext_mini(in_channels=in_channels, num_classes=num_classes, **kwargs)
     if name == "baseline":
         return BaselineCNN(in_channels=in_channels, num_classes=num_classes, **kwargs)
-    raise ValueError(f"Unknown model '{name}'; expected 'convnext' or 'baseline'")
+    raise ValueError(
+        f"Unknown model '{name}'; expected 'convnext', 'convnext-pretrained', "
+        f"'convnext-mini' or 'baseline'"
+    )
