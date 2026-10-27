@@ -18,12 +18,15 @@
 # Every model must be trained before the comparison in the README can be made;
 # they share a seed and therefore an identical patient-level split.
 #
-# convnext-pretrained needs the ImageNet weights cached in $HOME before the job
-# starts, because compute nodes have no outbound network access. Run this once
-# on the login node:
+# convnext-pretrained needs the ImageNet weights cached before the job starts,
+# because compute nodes have no outbound network access. Rangpur points
+# TORCH_HOME at /cache, which is not guaranteed to be the same filesystem on
+# the compute node, so both the pre-download and the job below pin it to $HOME.
+# Run this once on the login node:
 #
-#   python -c "from torchvision.models import convnext_tiny, ConvNeXt_Tiny_Weights; \
-#              convnext_tiny(weights=ConvNeXt_Tiny_Weights.IMAGENET1K_V1)"
+#   TORCH_HOME=$HOME/.cache/torch python -c \
+#     "from torchvision.models import convnext_tiny, ConvNeXt_Tiny_Weights; \
+#      convnext_tiny(weights=ConvNeXt_Tiny_Weights.IMAGENET1K_V1)"
 #
 # Author: s4980060
 
@@ -58,6 +61,11 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 source "$HOME/miniconda3/bin/activate"
 conda activate torch
 
+# Pin the weight cache to home. The cluster default (/cache) may be node-local,
+# in which case the weights downloaded on the login node would be invisible here
+# and torchvision would try to re-download them without network access.
+export TORCH_HOME="$HOME/.cache/torch"
+
 # The data loader resolves real patient ids from meta_data_with_label.json,
 # which it expects beside the AD_NC directory. Fail early with a clear message
 # rather than part-way through training if the layout differs.
@@ -72,7 +80,7 @@ fi
 # Same idea for the pretrained weights: a missing cache would otherwise surface
 # as a network timeout several minutes into the job.
 if [[ "$MODEL" == "convnext-pretrained" ]]; then
-    CACHE="${TORCH_HOME:-$HOME/.cache/torch}/hub/checkpoints"
+    CACHE="$TORCH_HOME/hub/checkpoints"
     if ! ls "$CACHE"/convnext_tiny-*.pth >/dev/null 2>&1; then
         echo "ERROR: ImageNet weights not cached in $CACHE" >&2
         echo "Compute nodes cannot reach the internet. Pre-download them on the" >&2
