@@ -236,9 +236,12 @@ def load_imagenet_weights(model, verbose=True):
     The classifier head is not copied: it predicts 1000 ImageNet classes, while
     this task has 2, and it is trained from scratch.
     """
-    from torchvision.models import ConvNeXt_Tiny_Weights, convnext_tiny as tv_convnext_tiny
+    from torchvision.models import ConvNeXt_Tiny_Weights
 
-    source = tv_convnext_tiny(weights=ConvNeXt_Tiny_Weights.IMAGENET1K_V1).state_dict()
+    # The state dict is fetched directly rather than by building torchvision's
+    # model and reading its weights: nothing of that model is wanted here, and
+    # constructing 27.8M parameters only to discard them is pure waste.
+    source = ConvNeXt_Tiny_Weights.IMAGENET1K_V1.get_state_dict(progress=False)
     target = model.state_dict()
     mapping = {}
 

@@ -110,10 +110,12 @@ def print_confusion(probs, labels):
 def aggregate_by_patient(probs, labels, patient_ids):
     """Pool every slice of a patient into one prediction by mean probability.
 
-    Clinically the unit of decision is the patient, not the slice: a report is
-    issued per scan. Slice-level accuracy can also disguise patients whose
-    slices are split roughly 50/50, which are exactly the cases a triage system
-    should refer.
+    Grouping is by patient, so a patient scanned at several visits contributes
+    all of those scans' slices to one decision. That is the clinical unit: the
+    question is whether this person has AD, not whether one image looks like it.
+
+    Slice-level accuracy can also disguise patients whose slices split roughly
+    50/50, which are exactly the cases a triage system should refer.
     """
     probs = probs.detach().cpu()
     labels = labels.detach().cpu()
@@ -212,9 +214,9 @@ def threshold_sweep(probs, labels, thresholds=None):
             if int(retained_ad.sum()) > 0
             else float("nan")
         )
-        # Recall over *all* AD cases, counting referred ones as not auto-cleared:
-        # this is the number that matters clinically, since a referred AD case
-        # still reaches a specialist.
+        # ad_recall_retained is computed over retained AD cases only: of the AD
+        # slices this policy chooses to auto-decide, how many does it get right.
+        # Referred AD cases are excluded because a specialist still sees them.
         rows.append(
             {
                 "threshold": float(threshold),
