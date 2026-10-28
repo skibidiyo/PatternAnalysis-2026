@@ -486,3 +486,117 @@ def cross_validate_labels(records, metadata_path):
             f"e.g. {disagreements[:3]}"
         )
     return checked
+
+
+def run_audit(root, metadata_path=None, seed=42, val_frac=0.15, test_frac=0.15):
+    """Produce the evidence the README's data-audit section rests on.
+
+    Three independent checks, each of which would invalidate the reported
+    results if it failed:
+
+      1. how many patients the dataset's own train/test folders share,
+      2. whether the folder-derived labels agree with the metadata diagnosis,
+      3. whether the rebuilt split is genuinely patient-disjoint.
+
+    Returns a JSON-serialisable dict; `main()` writes it to disk so the claims
+    can be checked without rerunning anything.
+    """
+    root = Path(root)
+    if metadata_path is None:
+        metadata_path = root.parent / DEFAULT_METADATA_FILENAME
+
+    records = index_all_slices(root, metadata_path=metadata_path)
+    leakage = audit_provided_split(root, metadata_path=metadata_path)
+    checked = cross_validate_labels(records, metadata_path)
+
+    splits = patient_level_split(
+        records, val_frac=val_frac, test_frac=test_frac, seed=seed
+    )
+    verify_split_disjoint(splits)
+
+    by_patient = _group_by_patient(records)
+    patient_labels = {p: rs[0].label for p, rs in by_patient.items()}
+    scans = {r.scan_id: r.label for r in records}
+
+    return {
+        "n_slices": len(records),
+        "n_scans": len(scans),
+        "n_patients": len(by_patient),
+        "slices_by_class": {
+            name: sum(1 for r in records if r.label == idx)
+            for name, idx in CLASS_TO_IDX.items()
+        },
+        "scans_by_class": {
+            name: sum(1 for lab in scans.values() if lab == idx)
+            for name, idx in CLASS_TO_IDX.items()
+        },
+        "patients_by_class": {
+            name: sum(1 for lab in patient_labels.values() if lab == idx)
+            for name, idx in CLASS_TO_IDX.items()
+        },
+        "provided_split_leakage": {
+            k: v for k, v in leakage.items() if k != "overlap_ids"
+        },
+        # Kept so the count can be traced back to named subjects rather than
+        # taken on trust.
+        "overlapping_patient_ids": sorted(leakage["overlap_ids"]),
+        "label_cross_validation": {
+            "scans_checked": checked,
+            "disagreements": 0,  # cross_validate_labels raises on any
+        },
+        "rebuilt_split": {
+            "seed": seed,
+            "patients": {k: len({r.patient_id for r in v}) for k, v in splits.items()},
+            "slices": {k: len(v) for k, v in splits.items()},
+            "disjoint_verified": True,
+        },
+    }
+
+
+def main():
+    """CLI for the data audit: `python dataset.py --audit --root <AD_NC>`."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="ADNI dataset audit.")
+    parser.add_argument("--root", required=True, help="Path to the AD_NC directory.")
+    parser.add_argument("--metadata", default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--out", default="outputs/split_audit.json")
+    parser.add_argument(
+        "--audit", action="store_true", help="Run the audit (the only mode so far)."
+    )
+    args = parser.parse_args()
+
+    if not args.audit:
+        parser.error("nothing to do: pass --audit")
+
+    report = run_audit(args.root, metadata_path=args.metadata, seed=args.seed)
+
+    print(f"slices   {report['n_slices']}  {report['slices_by_class']}")
+    print(f"scans    {report['n_scans']}  {report['scans_by_class']}")
+    print(f"patients {report['n_patients']}  {report['patients_by_class']}")
+    leak = report["provided_split_leakage"]
+    print(
+        f"\nprovided split: train {leak['train_patients']} patients, "
+        f"test {leak['test_patients']} patients, "
+        f"OVERLAPPING {leak['overlapping_patients']}"
+    )
+    print(
+        f"labels: {report['label_cross_validation']['scans_checked']} scans agree "
+        f"with the metadata diagnosis, 0 disagreements"
+    )
+    rebuilt = report["rebuilt_split"]
+    print(
+        f"rebuilt split (seed {rebuilt['seed']}): patients {rebuilt['patients']}, "
+        f"slices {rebuilt['slices']}, disjoint verified"
+    )
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"\nAudit written to {out}")
+
+
+if __name__ == "__main__":
+    main()

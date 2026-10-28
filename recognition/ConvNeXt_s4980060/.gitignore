@@ -18,7 +18,10 @@ data/
 
 # --- Training outputs and logs ---
 # Figures used in the README go in assets/, which is NOT ignored.
-outputs/
+outputs/*
+# The data audit is evidence for the README's headline finding, not a build
+# artefact, so it is tracked while the checkpoints and logs beside it are not.
+!outputs/split_audit.json
 runs/
 logs/
 wandb/
@@ -46,3 +49,6 @@ env/
 .idea/
 .DS_Store
 Thumbs.db
+outputs_e20/
+eval_e20/
+assets_e20/

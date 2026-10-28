@@ -22,6 +22,7 @@ Author: s4980060
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -282,6 +283,39 @@ def plot_threshold_sweep(sweep, out_path, chosen=None):
     plt.close(fig)
 
 
+def measure_latency(model, device, batch_size=32, image_size=224, n_warmup=5, n_runs=30):
+    """Mean forward-pass time per slice, so the README can price each model.
+
+    Warm-up passes are discarded because the first calls pay for cuDNN
+    autotuning and lazy CUDA initialisation, which a deployed service pays once
+    rather than per scan.
+    """
+    # main() passes a device string; accept either form.
+    device = torch.device(device)
+    x = torch.randn(batch_size, 1, image_size, image_size, device=device)
+    model.eval()
+    with torch.no_grad():
+        for _ in range(n_warmup):
+            model(x)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        for _ in range(n_runs):
+            model(x)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - start) / n_runs
+
+    return {
+        "batch_size": batch_size,
+        "image_size": image_size,
+        "n_warmup": n_warmup,
+        "n_runs": n_runs,
+        "ms_per_batch": elapsed * 1000,
+        "ms_per_slice": elapsed * 1000 / batch_size,
+    }
+
+
 def select_failure_cases(probs, labels, records, n=5, one_per_patient=True):
     """Pick the most instructive errors: confident mistakes, worst first.
 
@@ -471,6 +505,12 @@ def main():
             f"confidence {case['confidence']:.3f}  P(AD) {case['p_ad']:.3f}"
         )
 
+    latency = measure_latency(model, device, batch_size=args.batch_size)
+    print(
+        f"\nInference: {latency['ms_per_batch']:.1f} ms/batch of "
+        f"{latency['batch_size']} ({latency['ms_per_slice']:.2f} ms/slice)"
+    )
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / f"{name}_evaluation.json", "w") as f:
@@ -482,6 +522,11 @@ def main():
                 "patient_metrics": patient_metrics | {"ece": patient_ece},
                 "majority_baseline": majority,
                 "recommended_threshold": chosen,
+                "latency": latency,
+                # The full sweeps are stored so the coverage/accuracy trade-off
+                # quoted in the README can be checked without rerunning this.
+                "validation_sweep": val_sweep,
+                "test_sweep": threshold_sweep(test_probs, test_labels),
                 "failures": [
                     {
                         "patient_id": c["record"].patient_id,
