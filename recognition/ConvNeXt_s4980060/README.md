@@ -8,7 +8,14 @@
 1. [Problem Description](#1-problem-description)
 2. [How ConvNeXt Works](#2-how-convnext-works)
 3. [Feasibility Review](#3-feasibility-review)
-4. [Repository Structure](#4-repository-structure)
+4. [Results](#4-results)
+5. [Resource Profiling](#5-resource-profiling)
+6. [Triage Policy and Failure Autopsy](#6-triage-policy-and-failure-autopsy)
+7. [Engineering Recommendation](#7-engineering-recommendation)
+8. [Reproducing the Results](#8-reproducing-the-results)
+9. [Repository Structure](#9-repository-structure)
+10. [References](#10-references)
+11. [Artificial Intelligence Usage Disclosure](#11-artificial-intelligence-usage-disclosure)
 
 ---
 
@@ -38,7 +45,6 @@ the inductive biases of convolutions, which matters for a small medical dataset.
 
 ## 3. Feasibility Review
 
-*The one-page review presented at the midpoint check-off.*
 
 ### 3.1 User Need, Scope and Acceptance Criteria
 
@@ -54,7 +60,7 @@ cost compared with a simple CNN?
 |---|-----------|--------|
 | 1 | Accuracy | Test accuracy ≥ 0.80 for AD vs CN |
 | 2 | Calibration | Expected Calibration Error (ECE) ≤ 0.10 after calibration, and lower than the baseline's ECE |
-| 3 | Resources | Peak training VRAM ≤ 16 GB and one training run ≤ 2 h on one Rangpur GPU |
+| 3 | Resources | Peak training VRAM ≤ 16 GB and one training run ≤ 2 h on a single GPU |
 
 ### 3.2 Model Choice and Course Concepts
 
@@ -97,6 +103,10 @@ test 102 (21,560 / 4,580 / 4,380 slices) with zero overlap, and no patient carri
 labels were additionally cross-checked against the diagnostic code in `meta_data_with_label.json`: all 1,526
 scans agree.
 
+Every count in this section is produced by `python dataset.py --audit --root <path>/AD_NC` and saved to
+[outputs/split_audit.json](outputs/split_audit.json), including the 216 overlapping subject ids by name, so
+the leakage claim can be checked rather than taken on trust.
+
 | Model | Parameters | Measurement | Result |
 |-------|-----------|-------------|--------|
 | Tiny baseline CNN | 0.02M | ~8 s/epoch, 0.29 GB GPU memory | Still predicted a single class after 2 epochs (val acc 0.51) → needs input normalisation and longer training |
@@ -117,14 +127,378 @@ scans agree.
 - **Fallback:** if ConvNeXt doesn't reach 0.8 accuracy, try a smaller ConvNeXt with more augmentation. If it is
   still short, report the real result and explain why.
 
-## 4. Repository Structure
+## 4. Results
+
+Every run shares seed 42 and therefore the identical patient-level split (476 / 102 / 102 patients). The
+best epoch within a run is chosen by **validation AUROC**, not accuracy, because the patient-level class mix
+is 32 / 68 and accuracy would favour a model that simply leans towards CN.
+
+| Model | Params | Recipe | Val AUROC | Slice acc | Slice AUROC | Patient acc | Slice AD recall | ECE (cal.) |
+|-------|--------|--------|-----------|-----------|-------------|-------------|-----------|------------|
+| Baseline CNN | 0.02M | 30 ep, lr 3e-4 | 0.7468 | 0.7970 | 0.8696 | 0.8039 | 0.7134 | 0.1144 |
+| ConvNeXt-T (scratch) | 27.8M | 30 ep, lr 3e-4 | 0.6997 | 0.6811 | 0.7572 | 0.6961 | 0.7289 | 0.0372 |
+| ConvNeXt-mini (scratch) | 4.8M | 30 ep, lr 3e-4 | 0.7015 | 0.6897 | 0.7561 | 0.7353 | 0.7036 | 0.0397 |
+| **ConvNeXt-T (ImageNet)** | 27.8M | 12 ep, lr 5e-5 | **0.8635** | **0.8295** | 0.9091 | 0.8725 | 0.7995 | **0.0387** |
+| ConvNeXt-T (ImageNet) | 27.8M | 20 ep, lr 5e-5 | 0.8602 | 0.8441 | 0.9250 | 0.8824 | 0.8454 | 0.0486 |
+
+Majority-class baseline (predict CN for every patient): **0.6765**.
+
+The bold row is the reported model. It is selected on **validation** AUROC, so the 20-epoch run is not
+chosen despite scoring higher on every test metric — §4.3 explains why that restraint matters.
+
+**Acceptance criteria.** All three are met by the pretrained ConvNeXt: slice accuracy 0.8295 ≥ 0.80
+(criterion 1); slice ECE 0.0387 ≤ 0.10 and below the baseline's 0.1144 (criterion 2); peak VRAM 4.10 GB
+≤ 16 GB and 54.8 min ≤ 2 h (criterion 3). Criterion 2 is met at slice level; patient-level ECE is 0.0983,
+inside the threshold but much closer to it. Averaging a patient's slice probabilities (`aggregate_by_patient`
+in [predict.py](predict.py)) sharpens confidence without making it proportionally more accurate, because the
+20 slices of one scan are not 20 independent observations.
+
+### 4.1 Initialisation, not architecture, was the bottleneck
+
+The scratch and 12-epoch ImageNet rows above are the *same 27.82M-parameter network* — identical code,
+identical split, identical augmentation, identical 12-epoch best. Only the starting weights differ, and that
+alone moves slice accuracy from 0.6811 to 0.8295. (Both runs happen to select epoch 12 on validation, so
+even the training length is matched.) From scratch the network barely clears the majority-class baseline;
+fine-tuned from ImageNet it is the only configuration that meets the accuracy target.
+
+The epoch-1 validation accuracies make the mechanism plain: 0.7098 fine-tuned, against 0.5648 for
+ConvNeXt-T and 0.5485 for ConvNeXt-mini from scratch — barely above chance. 21,560 training slices are not enough to learn 27.8M parameters from random initialisation, but they
+are ample for adapting features already learned elsewhere — even though those features come from natural
+colour photographs and these are single-channel brain MRI. The ImageNet stem is adapted to one channel by
+summing its three input filters, and the classifier head is the only part trained from scratch
+(180 / 180 pretrained tensors loaded; see `load_imagenet_weights` in [modules.py](modules.py)).
+
+Two intermediate hypotheses were tested and rejected along the way.
+
+**Overfitting.** The from-scratch gap between training and validation accuracy reaches 36 pp (0.9946 against
+0.6376). Shrinking the network to 4.8M parameters and raising stochastic depth to 0.2 narrowed that gap to
+26 pp at the selected epoch, and left accuracy unchanged at 0.6897. Regularisation moved the symptom without
+moving the result, so overfitting was not the limiting factor. (An earlier 15-epoch variant with heavier
+augmentation — random resized crop, ±15° rotation, colour jitter — narrowed the gap further still and scored
+0.6776, lower again; its artefacts were overwritten by the run reported here, so only its test accuracy is
+quoted.)
+
+**The patchify stem.** ConvNeXt downsamples 32× in total, to a 7×7 final feature map, against 8× and 28×28
+for the baseline, which plausibly discards the fine-scale atrophy that AD is read from. The pretrained model
+refutes this directly: same 4×4 stride-4 stem, same 7×7 map, 0.8295.
+
+### 4.2 Calibration
+
+Temperature scaling (Guo et al., 2017), fitted on validation only, never changes a prediction — it rescales
+the logits — so accuracy, F1 and AUROC are identical before and after. It changes only whether the reported
+confidence can be believed.
+
+| Model | Temperature | Test ECE before | Test ECE after |
+|-------|-------------|-----------------|----------------|
+| ConvNeXt-T (ImageNet, 12 ep) | 5.62 | 0.1430 | 0.0387 |
+| ConvNeXt-T (ImageNet, 20 ep) | 5.63 | 0.1295 | 0.0486 |
+| ConvNeXt-T (scratch) | 5.17 | 0.2133 | 0.0372 |
+| ConvNeXt-mini (scratch) | 4.41 | 0.1764 | 0.0397 |
+| Baseline CNN | 2.09 | 0.0162 | **0.1144** |
+
+**The fitted temperature orders the models exactly by how hard they memorised the training set:**
+
+| Model | Final train acc | Temperature |
+|-------|-----------------|-------------|
+| ConvNeXt-T (ImageNet) | 0.9990 | 5.62 |
+| ConvNeXt-T (scratch) | 0.9946 | 5.17 |
+| ConvNeXt-mini (scratch) | 0.9671 | 4.41 |
+| Baseline CNN | 0.8096 | 2.09 |
+
+The relationship is monotonic across a 1,176× range of model size. A network that reaches 99.9% training
+accuracy has learned that extreme confidence is always rewarded, because on the data it memorised it almost
+always is; the temperature is the correction that fact demands. The 0.02M baseline cannot memorise 21,560
+slices, is never rewarded for overconfidence, and needs little correction.
+
+Note also that every ConvNeXt variant lands at ECE 0.037–0.049 after scaling, whether its accuracy is 0.69 or
+0.84. Calibration quality and discrimination are separate properties: a model can be reliably wrong.
+
+The baseline is the instructive case: its uncalibrated ECE was already 0.0162, and calibration made it
+**seven times worse**. A temperature fitted on validation only transfers to test when the two distributions
+of confidence agree, and for the baseline they did not. Calibration is therefore not a free post-processing
+step — it has to be validated on held-out data like any other model choice, and an already well-calibrated
+model should be left alone.
+
+Reliability diagrams: [assets/convnext-pretrained_reliability.png](assets/convnext-pretrained_reliability.png),
+[assets/baseline_reliability.png](assets/baseline_reliability.png).
+
+### 4.3 Run-to-run variance, and selecting without the test set
+
+Training the same configuration for 20 epochs instead of 12 produced a model that is better on every test
+metric — slice accuracy 0.8441, AUROC 0.9250, AD recall 0.8454 against 0.7995, which is 89 fewer missed AD
+slices. It is nonetheless *not* the reported model, because **validation AUROC prefers the 12-epoch run**
+(0.8635 against 0.8602).
+
+Reporting the 20-epoch run would mean choosing a hyperparameter by its test score, which is the same class of
+mistake as the patient leakage this project exists to document: it turns the test set into a selection set and
+the quoted accuracy stops being an estimate of unseen performance. The 12-epoch run is therefore reported,
+and the 20-epoch run is listed for comparison rather than promoted.
+
+The comparison is informative in its own right. Both runs are bit-identical for their first three epochs —
+seed 42 fixes the data order, the head initialisation and the augmentation — and diverge from epoch 4 only
+because the cosine learning-rate schedule is stretched over 20 epochs instead of 12. Both then select epoch
+12 by validation AUROC. The 1.5 pp gap in test accuracy comes entirely from that difference in schedule
+shape, which is **the same order of magnitude as the gap between distinct configurations**. Any single
+accuracy figure quoted for this dataset therefore carries roughly ±1.5 pp of run-to-run noise, and
+differences smaller than that should not be read as evidence.
+
+The exercise also corrected a wrong diagnosis. The 12-epoch run selected its final epoch with validation
+AUROC still climbing (0.8611 → 0.8635), which looked like premature stopping. Extending the schedule showed
+otherwise: validation AUROC peaks at epoch 12 in both runs and then plateaus. The late climb was the cosine
+schedule annealing to zero, not a model still learning.
+
+### 4.4 Preprocessing and training details
+
+Not stated elsewhere, and needed to reproduce the numbers above.
+
+**Preprocessing.** Slices are loaded as single-channel greyscale, resized to 224×224, and normalised with
+mean 0.1159 and standard deviation 0.2227. Both statistics are computed **on the training split only**
+(`compute_channel_stats` in [dataset.py](dataset.py)); using the whole dataset would leak test-set
+information into the input scaling. Training augmentation is a horizontal flip at p = 0.5 and a rotation of
+up to ±10° (`--augment light`); validation and test apply the resize and normalisation alone.
+
+**Optimisation.** AdamW, weight decay 0.05, cross-entropy without label smoothing, batch size 32. The
+learning rate warms up linearly for 2 epochs and then follows a cosine decay to zero over the remaining
+epochs — which is why the 12-epoch and 20-epoch runs of §4.3 diverge despite sharing a seed.
+
+**No early stopping.** Every run trains its full epoch budget; the reported model is the epoch with the best
+validation AUROC, restored from the checkpoint at the end. This separates "when to stop training" from "which
+weights to keep" and costs only compute.
+
+## 5. Resource Profiling
+
+Measured on one RTX 4070 laptop GPU (8 GB), batch 32, 224 px, FP32. Latency is the mean of 30 forward passes
+after 5 discarded warm-up passes, with `torch.cuda.synchronize()` around the timed region; it is measured by
+`measure_latency` in [predict.py](predict.py) and stored in each `outputs/{model}_evaluation.json`, so the
+figures below are read back from file rather than quoted from a one-off benchmark.
+
+| Model | Params | Peak train VRAM | Train time | Inference | Slice acc |
+|-------|--------|-----------------|------------|-----------|-----------|
+| Baseline CNN | 0.02M | 0.55 GB | 13.8 min (30 ep) | 0.36 ms/slice | 0.7970 |
+| ConvNeXt-mini | 4.8M | 1.40 GB | 37.0 min (30 ep) | 0.75 ms/slice | 0.6897 |
+| ConvNeXt-T (scratch) | 27.8M | 4.10 GB | 149.4 min (30 ep) | 2.71 ms/slice | 0.6811 |
+| ConvNeXt-T (ImageNet) | 27.8M | 4.10 GB | **54.8 min (12 ep)** | 2.69 ms/slice | **0.8295** |
+| ConvNeXt-T (ImageNet) | 27.8M | 4.10 GB | 84.5 min (20 ep) | 2.70 ms/slice | 0.8441 |
+
+ConvNeXt-T costs 1,176× the parameters and 7.5× the inference time of the baseline to buy 3.3 pp of slice
+accuracy and 6.9 pp of patient accuracy. In absolute terms 2.7 ms/slice is still negligible — a 20-slice scan
+is classified in 54 ms — so the cost that matters is training and memory, not serving.
+
+Fine-tuning also makes the large model *cheaper to train* than training it from scratch: 54.8 min against
+149.4 min, because it converges in 12 epochs rather than 30. The three ConvNeXt-T rows share one architecture
+and therefore one latency and one VRAM figure; the 0.02 ms spread between them is measurement noise.
+
+## 6. Triage Policy and Failure Autopsy
+
+### 6.1 Reject option
+
+The intended use is triage: automate confident slices, refer the rest. [predict.py](predict.py) sweeps the
+confidence threshold **on validation**, picks the lowest one meeting a floor on both accuracy and AD recall
+among retained cases, and only then applies it to test. Selecting the threshold on the test sweep would
+reproduce in miniature the mistake §4.3 refuses to make.
+
+Validation is consistently harder than test here — 0.7838 against 0.8295 at full coverage — so a
+validation-fitted threshold is conservative when transferred, which is the safe direction for a clinical
+gate. The sweeps are saved in `outputs/{model}_evaluation.json` under `validation_sweep` and `test_sweep`
+([assets/convnext-pretrained_threshold.png](assets/convnext-pretrained_threshold.png) plots the test curve):
+
+| Floor on validation | Threshold | Val coverage | Test coverage | Test accuracy | Test AD recall |
+|---------------------|-----------|--------------|---------------|---------------|----------------|
+| 0.80 / 0.80 | 0.67 | 81.2% | 84.0% | 0.8821 | 0.8548 |
+| **0.85 / 0.85** | **0.85** | **45.7%** | **50.8%** | **0.9469** | **0.9034** |
+| 0.90 / 0.90 | 0.93 | 0.9% | 1.3% | 1.0000 | 1.0000 |
+| 0.95 / 0.95 | 0.93 | 0.9% | 1.3% | 1.0000 | 1.0000 |
+
+The script's default floors are 95 / 95, and at those it returns threshold 0.93 — automating 1.3% of slices
+and referring 4,321 of 4,380. That looks like a failure, but the table shows which constraint binds. On
+validation, accuracy alone passes 0.95 at threshold 0.93 only because 43 slices remain; **AD recall is the
+limiting term**, climbing to just 0.8828 at threshold 0.90 before the retained set becomes too small to
+measure.
+
+Relaxing both floors to 0.85 gives a usable operating point: **threshold 0.85 automates 50.8% of test slices
+at 0.9469 accuracy and 0.9034 AD recall**, referring the other 49.2% to a specialist. At 0.80 floors,
+coverage rises to 84.0% but AD recall on retained cases falls to 0.8548 — one in seven retained AD slices
+still cleared wrongly.
+
+For comparison, at the default 95/95 floors the from-scratch ConvNeXt automates 1.6% of test slices and
+ConvNeXt-mini 0.05%, and the baseline CNN's retained 2.9% is only 0.8203 accurate — it cannot even hold the
+floor it was selected for. The practical gain from pretraining is therefore far larger than the 15 pp accuracy headline suggests:
+it is the difference between a policy that can be operated and one that cannot.
+
+### 6.2 Failure cases
+
+The five highest-confidence errors of the reported model
+([assets/convnext-pretrained_failures.png](assets/convnext-pretrained_failures.png)), one per patient:
+
+| Patient | Scan | Slice | Truth | Predicted | Confidence |
+|---------|------|-------|-------|-----------|------------|
+| 168_S_6828 | 1240482 | 95 | AD | CN | 0.924 |
+| 137_S_6812 | 1271678 | 105 | AD | CN | 0.922 |
+| 168_S_6827 | 1239535 | 111 | AD | CN | 0.903 |
+| 037_S_6216 | 992628 | 96 | AD | CN | 0.900 |
+| 036_S_6231 | 973656 | 94 | AD | CN | 0.898 |
+
+All five are false negatives, but that is **not evidence of anything**: `select_failure_cases` sorts false
+negatives ahead of false positives by design ([predict.py](predict.py)), so a top-five list of this kind is
+guaranteed whenever any exist. What the list does show is their *confidence* — 0.90 to 0.92 after
+calibration, for AD scans called healthy.
+
+The asymmetry itself is established by the confusion matrix instead: AD recall 0.7995 against CN recall
+0.8533, **389 AD slices missed against 358 CN slices falsely flagged**. Since the test set holds 2,440 CN and
+only 1,940 AD slices, the model makes more errors on the smaller class in absolute terms, which is the
+clinically costly direction.
+
+Three observations:
+
+1. **The errors sit at or above the modal slice position.** Slice indices across the dataset span 67–114
+   (counted from the filenames: `ls AD_NC/*/*/ | sed 's/.*_//;s/.jpeg//' | sort -n | uniq -c`) and concentrate
+   at 88–97, which carry 353–520 slices each against 2 at index 70. The five failures are 94, 95, 96, 105 and
+   111, so three are at the top of the dense region and two are in the sparse superior tail. Five cases are too few to call this a pattern, but it is
+   consistent with the tail being both under-represented in training and anatomically further from the
+   hippocampal sections where atrophy is most legible.
+2. **The same patients fail in all three models, and one site dominates every list.** The 20-epoch run of
+   §4.3 and the 0.02M baseline CNN are, respectively, a different training trajectory and a different
+   architecture entirely. Their top-five failures overlap almost completely with the reported model's:
+
+   | Patient | Reported (12 ep) | 20-epoch run | Baseline CNN |
+   |---------|------------------|--------------|--------------|
+   | `168_S_6828` | ✓ | ✓ | ✓ |
+   | `168_S_6827` | ✓ | ✓ | ✓ |
+   | `137_S_6812` | ✓ | ✓ | ✓ |
+   | `168_S_6754` | — | ✓ | ✓ |
+   | `037_S_6216` | ✓ | — | — |
+   | `036_S_6231` | ✓ | — | — |
+   | `018_S_5240` | — | ✓ | — |
+   | `003_S_6833` | — | — | ✓ |
+
+   Three patients are missed by **all three** models, and **ADNI site 168 supplies three of five** in both
+   the 20-epoch and baseline lists. A 0.02M-parameter CNN and a 27.8M-parameter ImageNet-initialised ConvNeXt
+   share almost no inductive bias, no capacity and no initialisation, so agreement between them is a property
+   of the scans and not of any model. No amount of better training will fix these cases.
+
+   The site concentration is the actionable part: scanner and protocol differences between sites are a known
+   confounder in multi-site MRI, and a production system would need per-site validation, which a
+   102-patient test set cannot provide.
+
+3. **Confidence does not separate these from correct predictions.** At 0.90–0.92 they sit above the 0.85
+   operating threshold of §6.1, so the deployable triage policy would auto-clear all five. Referral reduces
+   the miss rate but does not eliminate it, which is why AD recall rather than accuracy should set the
+   operating point.
+
+## 7. Engineering Recommendation
+
+**Use ConvNeXt-T fine-tuned from ImageNet, operated at confidence threshold 0.85 with a mandatory
+specialist review of the referred 49%.** It is the only configuration that meets the accuracy target, and the
+only one whose confidence is both calibrated and useful enough to automate a meaningful share of the workload.
+
+Three caveats that would need resolving before clinical use:
+
+- **AD recall is 0.80 at full coverage and 0.90 at threshold 0.85** — not high enough for a screening tool
+  where a miss is the costly error. The 20-epoch run of §4.3 reaches 0.8454 at full coverage, so the headroom
+  is real even though validation did not justify selecting that run; a class-weighted loss or a decision
+  threshold moved off 0.5 is the principled way to claim it. Accuracy would fall, and that is the correct
+  trade.
+- **Calibration does not transfer unconditionally.** It helped the ConvNeXt substantially and hurt the
+  baseline badly. Any redeployment must refit and re-verify the temperature on data from the target site.
+- **The headline numbers depend entirely on the patient-level split.** The dataset's own train/test folders
+  share 216 patients; results quoted against that split are not comparable to these and will look better.
+
+If 3.43 ms/slice or 27.8M parameters is prohibitive, the 0.02M baseline retains 0.7970 slice accuracy at
+1/9.5 the latency — but it misses the accuracy target, and its confidence is the less trustworthy of the two
+once calibration is attempted.
+
+## 8. Reproducing the Results
+
+Measured with Python 3.11.15, PyTorch 2.13.0+cu130, torchvision 0.28.0+cu130, Pillow 12.3.0,
+matplotlib 3.11.1 and NumPy 2.4.6 on an RTX 4070 Laptop GPU (8 GB). NumPy is used in `predict.py` only —
+`modules.py`, `dataset.py` and `train.py` are PyTorch-only, as the specification requires. The data loader
+expects `meta_data_with_label.json` beside the
+`AD_NC` directory; it resolves real ADNI subject ids from it and refuses to run without it, because the
+patient-level split cannot be verified otherwise.
+
+```bash
+# the data audit behind section 3.3 - run this first, it fails loudly if the
+# metadata is missing or the split is not patient-disjoint
+python dataset.py --audit --root <path>/AD_NC
+
+# the headline model
+python train.py --model convnext-pretrained --data-root <path>/AD_NC \
+    --epochs 12 --lr 5e-5 --drop-path 0.1 --augment light
+python predict.py --checkpoint outputs/convnext-pretrained_best.pth --data-root <path>/AD_NC
+
+# the 20-epoch comparison of §4.3, written to a separate directory so the
+# reported model's artefacts are not overwritten
+python train.py --model convnext-pretrained --data-root <path>/AD_NC \
+    --epochs 20 --lr 5e-5 --out-dir outputs_e20 --assets-dir assets_e20
+python predict.py --checkpoint outputs_e20/convnext-pretrained_best.pth \
+    --data-root <path>/AD_NC --out-dir eval_e20 --assets-dir eval_e20
+
+# the comparison points, on the identical split (seed 42)
+python train.py --model baseline      --data-root <path>/AD_NC --epochs 30
+python train.py --model convnext      --data-root <path>/AD_NC --epochs 30
+python train.py --model convnext-mini --data-root <path>/AD_NC --epochs 30 --drop-path 0.2
+```
+
+On the Rangpur cluster, `sbatch run_rangpur.sh <model>` wraps the same two commands as a Slurm job on the
+`comp3710` partition. All numbers in this README were measured on an RTX 4070 laptop GPU (8 GB).
+
+## 9. Repository Structure
 
 ```
 ConvNeXt_s4980060/
-├── modules.py    # ConvNeXt and baseline model components (PyTorch)
-├── dataset.py    # ADNI loading, patient-level splits, augmentation
-├── train.py      # training, validation, testing, checkpointing, loss/metric plots
-├── predict.py    # loads trained weights, runs inference, visualises predictions
-├── assets/       # figures used in this README
+├── modules.py        # ConvNeXt and baseline model components, ImageNet weight mapping
+├── dataset.py        # ADNI loading, patient-level splits, augmentation, split audit
+├── train.py          # training, validation, testing, temperature scaling, checkpointing
+├── predict.py        # inference, triage policy sweep, failure autopsy, reliability diagrams
+├── run_rangpur.sh    # Slurm batch script for the Rangpur cluster
+├── assets/           # figures used in this README
+├── outputs/          # checkpoints and metric JSONs (git-ignored except the audit)
+│   └── split_audit.json   # evidence for the leakage finding in section 3.3
 └── README.md
 ```
+
+## 10. References
+
+[1] Z. Liu, H. Mao, C.-Y. Wu, C. Feichtenhofer, T. Darrell and S. Xie, "A ConvNet for the 2020s,"
+*CVPR*, 2022. — the ConvNeXt architecture implemented in [modules.py](modules.py).
+
+[2] C. Guo, G. Pleiss, Y. Sun and K. Q. Weinberger, "On Calibration of Modern Neural Networks,"
+*ICML*, 2017. — temperature scaling, §4.2.
+
+[3] G. Huang, Y. Sun, Z. Liu, D. Sedra and K. Q. Weinberger, "Deep Networks with Stochastic Depth,"
+*ECCV*, 2016. — the drop-path regularisation used in every ConvNeXt block.
+
+[4] C. K. Chow, "On optimum recognition error and reject tradeoff," *IEEE Transactions on Information
+Theory*, 1970. — the reject option formalised in §6.1.
+
+[5] Alzheimer's Disease Neuroimaging Initiative (ADNI), <https://adni.loni.usc.edu/>. — data source.
+
+[6] torchvision `ConvNeXt_Tiny_Weights.IMAGENET1K_V1`, used as the initialisation in §4.1 and mapped onto
+this implementation by `load_imagenet_weights`.
+
+## 11. Artificial Intelligence Usage Disclosure
+
+Generative AI (Claude, Anthropic) was used throughout this project as a coding and reviewing assistant. Its
+contribution was concentrated in: drafting and iterating on the four Python modules; suggesting the
+patient-level leakage audit, temperature scaling and reject-option analyses; and drafting this README.
+
+The author directed the work, chose and ran every experiment, and verified the claims made here. The ConvNeXt
+implementation was checked against the published parameter count and against torchvision's reference
+implementation (maximum absolute difference 1.43e-06 on pooled features); the metric implementations were
+checked against scikit-learn and by hand; and every number in this README is read back from the JSON
+artefacts in `outputs/`, not transcribed.
+
+Several AI-proposed claims were tested and found to be wrong, and the record is kept here deliberately:
+
+- Two explanations for the from-scratch accuracy plateau — overfitting, then the patchify stem — were
+  proposed, tested, and refuted (§4.1). The correct explanation came from the controlled comparison.
+- Extending training to 20 epochs was proposed on the grounds that validation AUROC was "still climbing";
+  it was not, and §4.3 records the correction.
+- A triage operating point was initially chosen by reading the *test* sweep, which contradicts the selection
+  discipline argued for in §4.3. §6.1 now selects on validation, and the reported coverage changed as a
+  result.
+- A table row once mixed metrics from two different runs of ConvNeXt-mini, and a fitted temperature was
+  quoted with the wrong rounding. Both were found by checking the README against the JSON artefacts.
+
+These errors were caught by auditing the write-up against the code and the saved outputs, which is why that
+audit is part of the method rather than an afterthought.
