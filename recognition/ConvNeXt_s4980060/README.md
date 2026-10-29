@@ -96,14 +96,17 @@ because the class balance looks very different at the two levels:
 The slice-level balance is an artefact: AD patients average 3.36 scans each against 1.71 for CN, so the two
 classes even out only after a patient is counted once per scan. Training operates on slices and is therefore
 effectively balanced, but **any patient-level metric faces a 68% majority-class baseline** — predicting CN
-for everyone would score 0.68. Per-class recall, macro-F1 and AUROC are reported for this reason, rather than
-aggregate accuracy alone.
+for everyone would score 0.68. Per-class precision and recall, macro-F1 and AUROC are reported for this reason
+(§4), rather than aggregate accuracy alone.
 
 **Key finding:** once real subject ids are resolved, the dataset's provided `train` and `test` folders
 **share 216 of the same patients**, which would make test results look better than they really are. (Judged by
 the scan number in the filename the folders appear perfectly disjoint, which is exactly why the leakage is easy
 to miss.) So I combine all the images and split them again by patient (70% train, 15% validation, 15% test,
 stratified so each split keeps a similar AD/CN mix), then assert that no patient appears in more than one set.
+The split is made over 680 patients, not 30,520 slices, so 15% is 102 test patients, of whom only 33 are AD.
+A smaller test set would make each patient-level AD recall figure rest on too few patients. The validation set
+is the same size because both the calibration temperature and the referral threshold are fitted on it.
 
 **Smoke test (RTX 4070 laptop GPU).** The rebuilt split assigns all 680 patients as train 476 / val 102 /
 test 102 (21,560 / 4,580 / 4,380 slices) with zero overlap, and no patient carries both labels. Folder-derived
@@ -128,7 +131,8 @@ the leakage claim can be checked rather than taken on trust.
   plus other regularisation. Finally, Rangpur's GPUs are shared, so jobs may wait in the queue.
 - **Budget** (initial estimate, to be updated after the first full training run): about 15 hours of GPU time —
   ~1 h for the baseline, ~10 h for ConvNeXt, ~2 h for analysis, and spare time for reruns. Short interactive
-  sessions for testing and batch jobs for long training.
+  sessions for testing and batch jobs for long training. *Actual:* the five training runs reported in §5
+  took 5.7 h in total (339.5 min), all on a local RTX 4070 laptop GPU, so no Rangpur queue time was needed.
 - **Next experiment:** train the simple CNN on the patient split, then train ConvNeXt on the same split, and
   compare their accuracy and how honest their confidence is.
 - **Fallback:** if ConvNeXt doesn't reach 0.8 accuracy, try a smaller ConvNeXt with more augmentation. If it is
@@ -152,6 +156,20 @@ Majority-class baseline (predict CN for every patient): **0.6765**.
 
 The bold row is the reported model. It is selected on **validation** AUROC, so the 20-epoch run is not
 chosen despite scoring higher on every test metric — §4.3 explains why that restraint matters.
+
+**Per-class metrics** for the reported model against the baseline, on the same test split:
+
+| Level | Model | CN precision | CN recall | AD precision | AD recall | Macro-F1 | AUROC |
+|-------|-------|--------------|-----------|--------------|-----------|----------|-------|
+| Slice | Baseline CNN | 0.7912 | 0.8635 | 0.8061 | 0.7134 | 0.7913 | 0.8696 |
+| Slice | **ConvNeXt-T (ImageNet, 12 ep)** | 0.8426 | 0.8533 | 0.8125 | 0.7995 | **0.8269** | **0.9091** |
+| Patient | Baseline CNN | 0.8101 | 0.9275 | 0.7826 | 0.5455 | 0.7539 | 0.8643 |
+| Patient | **ConvNeXt-T (ImageNet, 12 ep)** | 0.9000 | 0.9130 | 0.8125 | 0.7879 | **0.8532** | **0.9025** |
+
+The baseline's patient-level accuracy of 0.8039 hides an AD recall of 0.5455: it misses 15 of the 33 AD
+patients, against 7 for ConvNeXt. Its higher CN recall is the same lean towards the majority class that
+§4 selects on AUROC to avoid. Per-class figures for the from-scratch variants are in
+`outputs/{model}_evaluation.json`.
 
 **Acceptance criteria.** All three are met by the pretrained ConvNeXt: slice accuracy 0.8295 ≥ 0.80
 (criterion 1); slice ECE 0.0387 ≤ 0.10 and below the baseline's 0.1144 (criterion 2); peak VRAM 4.10 GB
@@ -380,6 +398,23 @@ negatives ahead of false positives by design ([predict.py](predict.py)), so a to
 guaranteed whenever any exist. What the list does show is their *confidence* — 0.90 to 0.92 after
 calibration, for AD scans called healthy.
 
+To cover the other direction, the two most confident **false positives** (one per patient) were taken from
+the same calibrated test predictions:
+
+![Two cognitively normal slices predicted AD, each labelled with its patient, scan and
+confidence](assets/convnext-pretrained_false_positives.png)
+
+| Patient | Scan | Slice | Truth | Predicted | Confidence |
+|---------|------|-------|-------|-----------|------------|
+| 127_S_6436 | 1021434 | 102 | CN | AD | 0.915 |
+| 137_S_4466 | 942799 | 93 | CN | AD | 0.908 |
+
+Both slices show a large lateral ventricle and widened sulci, the same features AD is read from. A slice
+classifier sees anatomy, not diagnosis: a cognitively normal brain with this much visible atrophy (which also
+occurs in normal ageing) looks like AD at the slice level, and the model has no clinical context to tell them
+apart. These errors are as confident as the false negatives, so they also pass the 0.85 threshold of §6.1. The
+cost is lower, though: they produce an unnecessary specialist review, not a missed diagnosis.
+
 The asymmetry itself is established by the confusion matrix instead: AD recall 0.7995 against CN recall
 0.8533, **389 AD slices missed against 358 CN slices falsely flagged**. Since the test set holds 2,440 CN and
 only 1,940 AD slices, the model makes more errors on the smaller class in absolute terms, which is the
@@ -460,6 +495,10 @@ expects `meta_data_with_label.json` beside the
 `AD_NC` directory; it resolves real ADNI subject ids from it and refuses to run without it, because the
 patient-level split cannot be verified otherwise.
 
+On Rangpur the dataset lives at `/home/groups/comp3710/ADNI`, so `<path>/AD_NC` below is
+`/home/groups/comp3710/ADNI/AD_NC`. That is also the default `--data-root` of `train.py` and `predict.py`, so
+on Rangpur the flag can be left out.
+
 ```bash
 # the data audit behind section 3.3 - run this first, it fails loudly if the
 # metadata is missing or the split is not patient-disjoint
@@ -482,6 +521,55 @@ python train.py --model baseline      --data-root <path>/AD_NC --epochs 30
 python train.py --model convnext      --data-root <path>/AD_NC --epochs 30
 python train.py --model convnext-mini --data-root <path>/AD_NC --epochs 30 --drop-path 0.2
 ```
+
+**Example output.** The input is a checkpoint plus the ADNI `AD_NC` folder; `predict.py` rebuilds the
+seed-42 test split itself. For the reported model, run with `--min-accuracy 0.85 --min-ad-recall 0.85`, it
+prints (patient-level confusion matrix and two failure lines omitted):
+
+```text
+Loaded 180/180 pretrained tensors (head trained from scratch)
+Model: convnext-pretrained | device: cuda
+Parameters: 27.82M
+Calibration temperature (fitted on validation): 5.6218
+
+Test set - slice level
+----------------------
+  accuracy        0.8295
+  macro-F1        0.8269
+  AUROC           0.9091
+  CN  precision 0.8426   recall 0.8533   F1 0.8479
+  AD  precision 0.8125   recall 0.7995   F1 0.8059
+  ECE             0.0387
+
+  confusion (rows = truth, cols = prediction)
+                 CN      AD
+    CN       2082     358
+    AD        389    1551
+
+Test set - patient level
+------------------------
+  accuracy        0.8725
+  macro-F1        0.8532
+  AUROC           0.9025
+  ...
+
+Reject-option policy
+--------------------
+  Chosen on validation: threshold 0.85 (validation accuracy 0.9064, coverage 0.4574)
+  Applied to test:      accuracy 0.9469 on 50.8% of slices (2156 of 4380 referred to a specialist)
+
+Failure cases (5)
+--------------------
+  168_S_6828 scan 1240482 slice  95  true AD -> pred CN  confidence 0.924  P(AD) 0.076
+  137_S_6812 scan 1271678 slice 105  true AD -> pred CN  confidence 0.922  P(AD) 0.078
+  168_S_6827 scan 1239535 slice 111  true AD -> pred CN  confidence 0.903  P(AD) 0.097
+  ...
+
+Inference: 84.4 ms/batch of 32 (2.64 ms/slice)
+```
+
+It also writes the evaluation figures (`{model}_reliability.png`, `{model}_threshold.png`,
+`{model}_failures.png`) to `assets/` and every number above to `outputs/{model}_evaluation.json`.
 
 On the Rangpur cluster, `sbatch run_rangpur.sh <model>` wraps the same two commands as a Slurm job on the
 `comp3710` partition. All numbers in this README were measured on an RTX 4070 laptop GPU (8 GB).
@@ -530,7 +618,9 @@ published parameter count and against torchvision's reference (maximum absolute 
 pooled features), the metrics against scikit-learn and by hand, and every results figure in §4–§6 against the
 saved artefacts in `outputs/`, `outputs_e20/` and `eval_e20/` — the exceptions being the §3.3 smoke-test
 measurements, the 0.6776 of the overwritten ConvNeXt-mini variant, and the §6.2 slice histogram, which exist
-only as console output or as the shell command printed beside them. Several AI-proposed claims were tested
+only as console output or as the shell command printed beside them, and the two §6.2 false positives, which
+were extracted from the reported checkpoint's calibrated test predictions with a one-off script (their
+total of 358 matches the saved confusion matrix). Several AI-proposed claims were tested
 and refuted: two explanations for the from-scratch plateau (overfitting, then the patchify stem, §4.1), the
 diagnosis that validation AUROC was "still climbing" at epoch 12 (§4.3), a triage threshold first chosen by
 reading the test sweep rather than validation (§6.1), and a results row that mixed metrics from two different
